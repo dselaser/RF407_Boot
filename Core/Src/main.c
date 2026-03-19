@@ -83,9 +83,9 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART6_UART_Init();
 
-  /* USB disabled - use without USB for now */
-  /* MX_USB_HOST_Init(); */
-  /* MX_FATFS_Init(); */
+  /* USB Host + FATFS for USB memory stick */
+  MX_USB_HOST_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
   Boot_Cmd_Init();
   Boot_HP_Init();
@@ -112,7 +112,7 @@ int main(void)
     Boot_Cmd_Process();
 
     /* USER CODE END WHILE */
-    /* MX_USB_HOST_Process(); */
+    MX_USB_HOST_Process();
 
     /* USER CODE BEGIN 3 */
   }

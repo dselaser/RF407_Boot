@@ -369,8 +369,10 @@ static void cmd_rs485_test(void)
   USART6->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_TXEIE);
 
   /* Clear any pending errors/data */
-  (void)USART6->SR;
-  (void)USART6->DR;
+  while (USART6->SR & USART_SR_RXNE)
+    (void)USART6->DR;
+  if (USART6->SR & (USART_SR_ORE | USART_SR_FE | USART_SR_NE))
+    (void)USART6->DR;
 
   /* TX: send @U*55\n + padding via register */
   Boot_Print("TX @U*55 ...");

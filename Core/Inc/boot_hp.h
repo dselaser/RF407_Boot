@@ -40,6 +40,21 @@ extern "C" {
 #define CNNX_MAX_DATA       240     /* Max payload per packet */
 #define CNNX_PKT_OVERHEAD   12      /* HDR(2)+DST+SRC+PID(2)+CMD+NDATA+CRC(2)+TRL(2) */
 
+/* Enable verbose/probing FWPREPARE variants (adds code size). */
+#ifndef BOOT_HP_CNNX_PROBE
+#define BOOT_HP_CNNX_PROBE  0
+#endif
+
+/* Enable baud-rate probing for CNNX phase (adds code size). */
+#ifndef BOOT_HP_BAUD_PROBE
+#define BOOT_HP_BAUD_PROBE  0
+#endif
+
+/* Enable minimal RX sniff on FWPREPARE timeout (adds small code/rodata). */
+#ifndef BOOT_HP_RX_SNIFF
+#define BOOT_HP_RX_SNIFF    0
+#endif
+
 /* H562 app base address */
 #define HP_APP_BASE         0x08008000U
 

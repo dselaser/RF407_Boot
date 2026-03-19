@@ -65,7 +65,10 @@ static void date_to_version(const char *date_str, char *out)
     day = (date_str[4] - '0') * 10 + (date_str[5] - '0');
 
   /* Year is at offset 7 */
-  snprintf(out, VERSION_STR_LEN, "%.4s-%02d-%02d", &date_str[7], month, day);
+  if (month < 1 || month > 12) month = 0;
+  if (day < 1 || day > 31) day = 0;
+  snprintf(out, VERSION_STR_LEN, "%.4s-%02u-%02u",
+           &date_str[7], (unsigned)month, (unsigned)day);
 }
 
 /* ------------------------------------------------------------------ */
