@@ -58,6 +58,20 @@ extern "C" {
 /* H562 app base address */
 #define HP_APP_BASE         0x08008000U
 
+/* ---- App Version struct (shared convention) ---- */
+#define APP_VERSION_MAGIC   0x56455253U  /* "VERS" */
+#define APP_VERSION_OFFSET  0x200U       /* 512 bytes from app flash base */
+
+typedef struct {
+  uint32_t magic;        /* APP_VERSION_MAGIC */
+  uint8_t  major;
+  uint8_t  minor;
+  uint8_t  patch;
+  uint8_t  _reserved;
+  char     date[12];     /* "2026-03-20" */
+  char     name[12];     /* "RF_Needle" etc */
+} AppVersion_t;          /* 32 bytes */
+
 /* ---- ASCII Phase ---- */
 #define HP_ASCII_TIMEOUT_MS 3000
 

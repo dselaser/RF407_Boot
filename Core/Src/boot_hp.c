@@ -451,7 +451,7 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
     uart6_send(pkt, (uint16_t)(CNNX_PKT_OVERHEAD + 10));
 
     Boot_Print("[H562] Erasing...\r\n");
-    ret = hp_cnnx_wait_cmd(CNNX_CMD_FWREADY, 2000);
+    ret = hp_cnnx_wait_cmd(CNNX_CMD_FWREADY, 15000);
     if (ret == 0) {
       ready = 1;
       break;

@@ -82,8 +82,6 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_USART6_UART_Init();
-
-  /* USB Host + FATFS for USB memory stick */
   MX_USB_HOST_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
