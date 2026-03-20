@@ -33,6 +33,9 @@ static uint8_t s_cmdIdx = 0;
 static USB_FileList_t s_fileList;
 static uint8_t        s_fileListValid = 0;
 
+/* ---- Progress tracking ---- */
+static uint8_t s_erase_dots;  /* dots printed for erase progress */
+
 /* ---- Forward declarations ---- */
 static void cmd_list(void);
 static void cmd_update(uint8_t index);
@@ -42,28 +45,10 @@ static void cmd_help(void);
 static void cmd_rs485_test(void);
 static void flash_progress_cb(const char *phase, uint8_t pct);
 
-/* ---- Helper: wait for Y/N input (30s timeout) ---- */
-static int wait_yn(void)
-{
-  Boot_Print("(Y/N) ");
-  uint32_t start = HAL_GetTick();
-  while ((HAL_GetTick() - start) < 30000) {
-    if (s_rxHead != s_rxTail) {
-      uint8_t ch = s_rxQueue[s_rxTail];
-      s_rxTail = (s_rxTail + 1) % RX_QUEUE_SIZE;
-      HAL_UART_Transmit(&huart1, &ch, 1, 10);
-      if (ch == 'Y' || ch == 'y') { Boot_Print("\r\n"); return 1; }
-      if (ch == 'N' || ch == 'n' || ch == '\r') { Boot_Print("\r\n"); return 0; }
-    }
-  }
-  Boot_Print("\r\n");
-  return 0;
-}
-
 /* ================================================================== */
 void Boot_Print(const char *fmt, ...)
 {
-  char buf[128];
+  char buf[96];
   va_list ap;
   va_start(ap, fmt);
   int len = vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -121,23 +106,23 @@ void Boot_Cmd_Process(void)
       else if ((c0 == 'H' || c0 == 'h') && s_cmdIdx == 1) {
         cmd_help();
       }
-      else if ((c0 == 'T' || c0 == 't') && s_cmdIdx == 1) {
-        cmd_rs485_test();
-      }
-      else if ((c0 == 'B' || c0 == 'b') && s_cmdIdx == 1) {
-        /* Boot both 407 app and H562 app */
-        Boot_Print("Sending A to H562...\r\n");
+      else if ((c0 == 'R' || c0 == 'r') && s_cmdIdx == 1) {
+        /* Run both 407 app and H562 app */
+        Boot_Print("HP run\r\n");
         Boot_HP_BootApp();
         if (Boot_Flash_IsAppValid()) {
-          Boot_Print("Booting 407 app...\r\n");
+          Boot_Print("Main run\r\n");
           HAL_Delay(100);
           Boot_Flash_JumpToApp();
         } else {
-          Boot_Print("407 app: not valid.\r\n");
+          Boot_Print("M:bad\r\n");
         }
       }
+      else if ((c0 == 'T' || c0 == 't') && s_cmdIdx == 1) {
+        cmd_rs485_test();
+      }
       else {
-        Boot_Print("Unknown cmd. Type H for help.\r\n");
+        Boot_Print("? Type H\r\n");
       }
 
       s_cmdIdx = 0;
@@ -165,35 +150,27 @@ void Boot_Cmd_Process(void)
 static void cmd_list(void)
 {
   if (!Boot_USB_IsReady()) {
-    Boot_Print("ERROR: USB not connected.\r\n");
+    Boot_Print("NoUSB\r\n");
     return;
   }
 
   int n = Boot_USB_ScanElfFiles(&s_fileList);
   if (n < 0) {
-    Boot_Print("ERROR: Cannot read USB.\r\n");
+    Boot_Print("USB err.\r\n");
     s_fileListValid = 0;
     return;
   }
   if (n == 0) {
-    Boot_Print("No .elf files found.\r\n");
+    Boot_Print("No ELF.\r\n");
     s_fileListValid = 0;
     return;
   }
 
   s_fileListValid = 1;
-  Boot_Print("--- ELF Files on USB ---\r\n");
   for (int i = 0; i < n; i++) {
-    /* FAT date: bit15:9=Year(0=1980), bit8:5=Month, bit4:0=Day */
-    uint16_t fd = s_fileList.files[i].fdate;
-    uint16_t year  = ((fd >> 9) & 0x7F) + 1980;
-    uint8_t  month = (fd >> 5) & 0x0F;
-    uint8_t  day   = fd & 0x1F;
-    Boot_Print("  [%d] %s: %04d-%02d-%02d\r\n",
-               i + 1, s_fileList.files[i].name,
-               year, month, day);
+    Boot_Print(" %d:%s\r\n", i + 1, s_fileList.files[i].name);
   }
-  Boot_Print("Total: %d file(s)\r\n", n);
+  Boot_Print("%d files\r\n", n);
 }
 
 /* ================================================================== */
@@ -202,23 +179,23 @@ static void cmd_list(void)
 static void cmd_update(uint8_t index)
 {
   if (!s_fileListValid) {
-    Boot_Print("Run L first to scan files.\r\n");
+    Boot_Print("L first\r\n");
     return;
   }
   if (index < 1 || index > s_fileList.count) {
-    Boot_Print("Invalid file index.\r\n");
+    Boot_Print("Bad#\r\n");
     return;
   }
 
   FIL fp;
   if (Boot_USB_OpenFile(&s_fileList, index, &fp) != 0) {
-    Boot_Print("Cannot open file.\r\n");
+    Boot_Print("Open err.\r\n");
     return;
   }
 
   Elf_Info_t elf;
   if (Elf_Parse(&fp, &elf) != 0) {
-    Boot_Print("Invalid ELF file.\r\n");
+    Boot_Print("Bad ELF.\r\n");
     f_close(&fp);
     return;
   }
@@ -230,23 +207,24 @@ static void cmd_update(uint8_t index)
                elf.seg_count, (unsigned long)(elf.total_flash_size / 1024));
 
     if (elf.flash_max > (APP_FLASH_END + 1)) {
-      Boot_Print("[Main] Address out of range!\r\n");
+      Boot_Print("[Main]Addr!\r\n");
       f_close(&fp);
       return;
     }
 
-    Boot_Version_RecordPre();
-
-    Boot_Print("[Main] Erasing...\r\n");
+    Boot_Print("[Main]Erase ");
+    s_erase_dots = 0;
     if (Boot_Flash_EraseApp(flash_progress_cb) != BOOT_FLASH_OK) {
-      Boot_Print("[Main] ERASE FAILED!\r\n");
+      Boot_Print(" Fail\r\n");
       f_close(&fp);
       return;
     }
+    Boot_Print(" OK\r\n");
 
-    Boot_Print("[Main] Programming...\r\n");
+    Boot_Print("[Main]Prog ");
     uint8_t buf[256];
     uint32_t total_written = 0;
+    uint8_t last_dot = 0;  /* dots printed so far (0-10) */
 
     for (uint8_t s = 0; s < elf.seg_count; s++) {
       uint32_t addr   = elf.seg[s].flash_addr;
@@ -258,19 +236,19 @@ static void cmd_update(uint8_t index)
         UINT br;
 
         if (f_lseek(&fp, foff) != FR_OK || f_read(&fp, buf, chunk, &br) != FR_OK || br != chunk) {
-          Boot_Print("\r\n[Main] READ ERROR!\r\n");
+          Boot_Print(" RdE\r\n");
           f_close(&fp);
           return;
         }
 
         if (Boot_Flash_Program(addr, buf, chunk) != BOOT_FLASH_OK) {
-          Boot_Print("\r\n[Main] WRITE ERROR!\r\n");
+          Boot_Print(" WrE\r\n");
           f_close(&fp);
           return;
         }
 
         if (Boot_Flash_Verify(addr, buf, chunk) != BOOT_FLASH_OK) {
-          Boot_Print("\r\n[Main] VERIFY ERROR!\r\n");
+          Boot_Print(" VfE\r\n");
           f_close(&fp);
           return;
         }
@@ -280,19 +258,23 @@ static void cmd_update(uint8_t index)
         remain -= chunk;
         total_written += chunk;
 
-        uint8_t pct = (uint8_t)((total_written * 100UL) / elf.total_flash_size);
-        Boot_Print("\r[Main] Programming... %d%%", pct);
+        uint8_t dots = (uint8_t)((total_written * 10UL) / elf.total_flash_size);
+        while (last_dot < dots) {
+          Boot_Print(".");
+          last_dot++;
+        }
       }
     }
 
     f_close(&fp);
-    Boot_Print("\r\n[Main] %lu bytes OK.\r\n", (unsigned long)total_written);
-    Boot_Version_RecordPost(s_fileList.files[index - 1].name);
+    Boot_Print(" OK\r\n");
+    Boot_Version_RecordPost(s_fileList.files[index - 1].name,
+                            s_fileList.files[index - 1].fdate);
 
     if (Boot_Flash_IsAppValid())
-      Boot_Print("[Main] Update OK! Press B to boot.\r\n");
+      Boot_Print("[Main]Done\r\n");
     else
-      Boot_Print("[Main] WARNING: App validation failed.\r\n");
+      Boot_Print("[Main]VFail!\r\n");
 
   } else if (elf.flash_min >= HP_APP_BASE) {
     /* ---- Handpiece (H562) via RS485 ---- */
@@ -302,34 +284,40 @@ static void cmd_update(uint8_t index)
     int ret = Boot_HP_UpdateFirmware(&fp, &elf);
     f_close(&fp);
 
-    if (ret == 0)
-      Boot_Print("[HP] Update OK!\r\n");
-    else
-      Boot_Print("[HP] Update FAILED (err=%d)\r\n", ret);
+    if (ret == 0) {
+      Boot_Print("[HP]OK\r\n");
+      Boot_Version_RecordHP(s_fileList.files[index - 1].fdate);
+    } else
+      Boot_Print("[HP]F%d\r\n", ret);
 
   } else {
-    Boot_Print("Unknown target (addr=0x%08lX)\r\n", (unsigned long)elf.flash_min);
+    Boot_Print("? target\r\n");
     f_close(&fp);
   }
 }
 
 /* ================================================================== */
-/* A - Auto: scan USB, compare versions, update if newer              */
+/* A - Auto: scan USB, update ALL ELF files, then boot                */
+/*     No questions asked — update every file found, then run.        */
 /* ================================================================== */
 static void cmd_auto(void)
 {
   if (!Boot_USB_IsReady()) {
-    Boot_Print("USB not connected.\r\n");
+    Boot_Print("NoUSB\r\n");
     return;
   }
 
   int n = Boot_USB_ScanElfFiles(&s_fileList);
   if (n <= 0) {
-    Boot_Print("No ELF files found.\r\n");
+    Boot_Print("No ELF.\r\n");
     s_fileListValid = 0;
     return;
   }
   s_fileListValid = 1;
+
+  /* --- Phase 1: Classify all ELF files --- */
+  int8_t main_idx = -1;   /* file index for 407 (1-based) */
+  int8_t hp_idx   = -1;   /* file index for H562 (1-based) */
 
   for (int i = 0; i < n; i++) {
     FIL fp;
@@ -338,84 +326,54 @@ static void cmd_auto(void)
 
     Elf_Info_t elf;
     if (Elf_Parse(&fp, &elf) != 0) { f_close(&fp); continue; }
-
-    /* Determine target */
-    const char *target;
-    uint32_t base;
-    if (elf.flash_min >= APP_FLASH_BASE) {
-      target = "Main"; base = APP_FLASH_BASE;
-    } else if (elf.flash_min >= HP_APP_BASE) {
-      target = "HP";   base = HP_APP_BASE;
-    } else {
-      f_close(&fp); continue;
-    }
-
-    /* Read version from ELF */
-    AppVersion_t elf_ver;
-    int elf_ok = 0;
-    {
-      uint8_t vbuf[sizeof(AppVersion_t)];
-      if (Elf_ReadAt(&fp, &elf, base + APP_VERSION_OFFSET,
-                     vbuf, sizeof(vbuf)) > 0) {
-        memcpy(&elf_ver, vbuf, sizeof(elf_ver));
-        if (elf_ver.magic == APP_VERSION_MAGIC) elf_ok = 1;
-      }
-    }
     f_close(&fp);
 
-    /* Read installed version from flash (Main only) */
-    AppVersion_t inst_ver;
-    int inst_ok = 0;
-    if (base == APP_FLASH_BASE) {
-      const AppVersion_t *p =
-          (const AppVersion_t *)(base + APP_VERSION_OFFSET);
-      if (p->magic == APP_VERSION_MAGIC) {
-        inst_ver = *p;
-        inst_ok = 1;
-      }
-    }
-
-    /* Display */
-    Boot_Print("[%d] %s [%s] ", i + 1, s_fileList.files[i].name, target);
-    if (elf_ok)
-      Boot_Print("USB:%d.%d.%d", elf_ver.major, elf_ver.minor, elf_ver.patch);
-    else
-      Boot_Print("USB:---");
-
-    if (inst_ok)
-      Boot_Print(" Now:%d.%d.%d", inst_ver.major, inst_ver.minor, inst_ver.patch);
-    else
-      Boot_Print(" Now:---");
-
-    /* Compare */
-    int is_new = 0;
-    if (elf_ok && inst_ok) {
-      if (elf_ver.major > inst_ver.major ||
-          (elf_ver.major == inst_ver.major &&
-           elf_ver.minor > inst_ver.minor) ||
-          (elf_ver.major == inst_ver.major &&
-           elf_ver.minor == inst_ver.minor &&
-           elf_ver.patch > inst_ver.patch)) {
-        Boot_Print(" -> NEW\r\n");
-        is_new = 1;
-      } else {
-        Boot_Print(" -> %s\r\n",
-            (elf_ver.major == inst_ver.major &&
-             elf_ver.minor == inst_ver.minor &&
-             elf_ver.patch == inst_ver.patch) ? "SAME" : "OLD");
-      }
-    } else if (elf_ok) {
-      Boot_Print(" -> NEW\r\n");
-      is_new = 1;
+    Boot_Print("%d:%s @%08lX", i + 1, s_fileList.files[i].name,
+               (unsigned long)elf.flash_min);
+    if (elf.flash_min >= APP_FLASH_BASE) {
+      main_idx = (int8_t)(i + 1);
+      Boot_Print(" ->Main\r\n");
+    } else if (elf.flash_min >= HP_APP_BASE) {
+      hp_idx = (int8_t)(i + 1);
+      Boot_Print(" ->HP\r\n");
     } else {
-      Boot_Print(" (no ver)\r\n");
+      Boot_Print(" ->skip\r\n");
     }
+  }
 
-    if (is_new) {
-      Boot_Print("Update? ");
-      if (wait_yn())
-        cmd_update((uint8_t)(i + 1));
-    }
+  if (main_idx < 0 && hp_idx < 0) {
+    Boot_Print("No target.\r\n");
+    return;
+  }
+
+  /* --- Phase 2: Update H562 first (if present) --- */
+  /*     H562 first because 407 update ends with reset */
+  if (hp_idx > 0) {
+    Boot_Print("\r\n==HP==\r\n");
+    cmd_update((uint8_t)hp_idx);
+  }
+
+  /* --- Phase 3: Update 407 (if present) --- */
+  if (main_idx > 0) {
+    Boot_Print("\r\n==Main==\r\n");
+    cmd_update((uint8_t)main_idx);
+  }
+
+  /* --- Phase 4: Boot both --- */
+  Boot_Print("\r\n==Boot==\r\n");
+
+  if (hp_idx > 0) {
+    Boot_Print("HP run\r\n");
+    Boot_HP_BootApp();
+    HAL_Delay(200);
+  }
+
+  if (Boot_Flash_IsAppValid()) {
+    Boot_Print("Main run\r\n");
+    HAL_Delay(100);
+    Boot_Flash_JumpToApp();
+  } else if (main_idx > 0) {
+    Boot_Print("M:bad\r\n");
   }
 }
 
@@ -424,17 +382,8 @@ static void cmd_auto(void)
 /* ================================================================== */
 static void cmd_version(void)
 {
-  Boot_Print("--- Version Info ---\r\n");
-  Boot_Print("Bootloader : %s\r\n", Boot_Version_GetBoot());
-  Boot_Print("407 App    : %s\r\n", Boot_Version_GetApp());
-
-  /* Query handpiece version via RS485 */
-  char hp_ver[16];
-  if (Boot_HP_GetVersion(hp_ver, sizeof(hp_ver)) == 0) {
-    Boot_Print("H562       : %s\r\n", hp_ver);
-  } else {
-    Boot_Print("H562       : (no response)\r\n");
-  }
+  Boot_Print("Main:%s\r\n", Boot_Version_GetApp());
+  Boot_Print("HP  :%s\r\n", Boot_Version_GetHP());
 }
 
 /* ================================================================== */
@@ -442,33 +391,30 @@ static void cmd_version(void)
 /* ================================================================== */
 static void cmd_help(void)
 {
-  Boot_Print("L  List ELF files\r\n"
-             "Ux Update (x=file#, auto-detect)\r\n"
-             "A  Auto (version compare + update)\r\n");
-  Boot_Print("V  Version\r\n"
-             "T  RS485 test\r\n"
-             "B  Boot app\r\n"
-             "H  Help\r\n");
+  Boot_Print(
+    "V  Version\r\n"
+    "L  List USB\r\n"
+    "Ux Update #x\r\n"
+    "A  Auto update\r\n");
+  Boot_Print(
+    "T  RS485 test\r\n"
+    "R  Run application\r\n"
+    "H  Help\r\n");
 }
 
+
 /* ================================================================== */
-/* T - RS485 (UART6) raw communication test                            */
+/* T - RS485 test                                                     */
 /* ================================================================== */
 static void cmd_rs485_test(void)
 {
   uint8_t rx_buf[32];
   uint16_t rx_cnt = 0;
 
-  /* Disable UART6 interrupts, use register-level access */
   USART6->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_TXEIE);
+  while (USART6->SR & USART_SR_RXNE) (void)USART6->DR;
+  if (USART6->SR & (USART_SR_ORE | USART_SR_FE | USART_SR_NE)) (void)USART6->DR;
 
-  /* Clear any pending errors/data */
-  while (USART6->SR & USART_SR_RXNE)
-    (void)USART6->DR;
-  if (USART6->SR & (USART_SR_ORE | USART_SR_FE | USART_SR_NE))
-    (void)USART6->DR;
-
-  /* Send @T test command */
   Boot_Print("TX @T ...");
   const char cmd[] = "@T*54\n";
   for (int i = 0; cmd[i]; i++) {
@@ -477,7 +423,6 @@ static void cmd_rs485_test(void)
   }
   while (!(USART6->SR & USART_SR_TC));
 
-  /* RX: 1.5s wait */
   uint32_t start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 1500 && rx_cnt < sizeof(rx_buf)) {
     uint32_t sr = USART6->SR;
@@ -500,7 +445,10 @@ static void cmd_rs485_test(void)
 /* ================================================================== */
 static void flash_progress_cb(const char *phase, uint8_t pct)
 {
-  Boot_Print("\r[407] %s... %d%%", phase, pct);
-  if (pct >= 100)
-    Boot_Print("\r\n");
+  (void)phase;
+  uint8_t dots = pct / 10;
+  while (s_erase_dots < dots) {
+    Boot_Print(".");
+    s_erase_dots++;
+  }
 }

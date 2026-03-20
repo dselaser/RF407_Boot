@@ -36,8 +36,12 @@ void Boot_Version_RecordPre(void);
 /**
   * @brief  Record new app version after update (post-update)
   * @param  filename  name of the .elf file used for update
+  * @param  fdate     FAT file date (bit15:9=Year-1980, bit8:5=Mon, bit4:0=Day)
   */
-void Boot_Version_RecordPost(const char *filename);
+void Boot_Version_RecordPost(const char *filename, uint16_t fdate);
+
+const char* Boot_Version_GetHP(void);
+void Boot_Version_RecordHP(uint16_t fdate);
 
 #ifdef __cplusplus
 }

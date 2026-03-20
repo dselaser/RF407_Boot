@@ -15,7 +15,8 @@ _Min_Stack_Size = 0x2000; /* 8KB stack */
 
 MEMORY
 {
-  FLASH  (rx)  : ORIGIN = 0x08000000, LENGTH = 64K   /* Bootloader only */
+  FLASH  (rx)  : ORIGIN = 0x08000000, LENGTH = 64K - 256  /* Bootloader code */
+  VSTORE (r)   : ORIGIN = 0x0800FF00, LENGTH = 256        /* Version slots */
   RAM    (xrw) : ORIGIN = 0x20000000, LENGTH = 128K
   CCMRAM (xrw) : ORIGIN = 0x10000000, LENGTH = 64K
 }
@@ -132,6 +133,14 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
+
+  /* Version storage - kept empty, written at runtime */
+  .vstore (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.vstore))
+    . = ALIGN(4);
+  } >VSTORE
 
   /DISCARD/ :
   {

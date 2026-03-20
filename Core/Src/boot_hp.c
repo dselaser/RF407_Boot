@@ -308,8 +308,9 @@ void Boot_HP_BootApp(void)
 /* ================================================================== */
 int Boot_HP_GetVersion(char *ver_buf, uint8_t buf_size)
 {
+  USART6->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_TXEIE);
   uart6_flush_rx();
-  hp_ascii_send('U');
+  hp_ascii_send('V');
 
   /* Wait for response - HP might echo 'U' as ACK */
   uint8_t buf[32];
@@ -344,15 +345,15 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
   s_packetId = 0;
 
   /* ---- Phase 1: ASCII - Enter update mode ---- */
-  Boot_Print("[H562] Sending update cmd...\r\n");
+  Boot_Print("[HP] Sending update cmd...\r\n");
 
   hp_ascii_send('U');
   ret = hp_ascii_wait_ack('U', HP_ASCII_TIMEOUT_MS);
   if (ret != 0) {
-    Boot_Print("[H562] No response.\r\n");
+    Boot_Print("[HP] No response.\r\n");
     return -1;
   }
-  Boot_Print("[H562] ACK received.\r\n");
+  Boot_Print("[HP] ACK received.\r\n");
 
   HAL_Delay(200);
   uart6_flush_rx();
@@ -360,6 +361,8 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
   /* ---- Phase 2: CNNX - Firmware transfer ---- */
   uint32_t fw_size   = elf->total_flash_size;
   uint32_t block_cnt = (fw_size + CNNX_MAX_DATA - 1) / CNNX_MAX_DATA;
+  Boot_Print("[HP] ELF: %lu KB, %lu blocks\r\n",
+             (unsigned long)(fw_size / 1024), (unsigned long)block_cnt);
 
   uint8_t prep_data[10];
   prep_data[0] = (uint8_t)(fw_size >> 24);
@@ -402,7 +405,7 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
                       CNNX_TRL_0, CNNX_TRL_1);
         uart6_send(pkt, (uint16_t)(CNNX_PKT_OVERHEAD + 10));
 
-        Boot_Print("[H562] Erasing...\r\n");
+        Boot_Print("[HP] Erasing...\r\n");
         ret = hp_cnnx_wait_cmd(CNNX_CMD_FWREADY, 2500);
         if (ret == 0) {
           ready = 1;
@@ -417,7 +420,7 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
   }
 
   if (!ready) {
-    Boot_Print("[H562] Erase timeout.\r\n");
+    Boot_Print("[HP] Erase timeout.\r\n");
     return -2;
   }
 #else
@@ -450,7 +453,7 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
                   CNNX_TRL_0, CNNX_TRL_1);
     uart6_send(pkt, (uint16_t)(CNNX_PKT_OVERHEAD + 10));
 
-    Boot_Print("[H562] Erasing...\r\n");
+    Boot_Print("[HP] Erasing...\r\n");
     ret = hp_cnnx_wait_cmd(CNNX_CMD_FWREADY, 15000);
     if (ret == 0) {
       ready = 1;
@@ -479,7 +482,7 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
                       CNNX_TRL_0, CNNX_TRL_1);
         uart6_send(pkt, (uint16_t)(CNNX_PKT_OVERHEAD + 10));
 
-        Boot_Print("[H562] Erasing...\r\n");
+        Boot_Print("[HP] Erasing...\r\n");
         ret = hp_cnnx_wait_cmd(CNNX_CMD_FWREADY, 2000);
         if (ret == 0) {
           ready = 1;
@@ -493,7 +496,10 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
 #endif
 
   if (!ready) {
-    Boot_Print("[H562] Erase timeout.\r\n");
+    if (ret == -(int)CNNX_CMD_FWFAILURE)
+      Boot_Print("[HP] FW rejected (too large for chip?).\r\n");
+    else
+      Boot_Print("[HP] Erase timeout.\r\n");
     return -2;
   }
 
@@ -503,50 +509,62 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
 
   ret = hp_cnnx_wait_cmd(CNNX_CMD_FWSTART, 5000);
   if (ret != 0) {
-    Boot_Print("[H562] Start timeout.\r\n");
+    Boot_Print("[HP] Start timeout.\r\n");
     return -2;
   }
 
   /* ---- Send firmware data blocks ---- */
-  Boot_Print("[H562] 0%%");
+  Boot_Print("[HP] Sending ");
   uint32_t addr = elf->flash_min;
   uint8_t  data_buf[CNNX_MAX_DATA];
-  uint8_t  last_pct = 0;
+  uint8_t  last_dot = 0;
 
   for (uint32_t blk = 0; blk < block_cnt; blk++) {
     uint32_t remain = fw_size - (blk * CNNX_MAX_DATA);
     uint8_t  chunk = (remain > CNNX_MAX_DATA) ? CNNX_MAX_DATA : (uint8_t)remain;
 
     if (Elf_ReadAt(fp, elf, addr, data_buf, chunk) < 0) {
-      Boot_Print("\r\n[H562] Read err.\r\n");
+      Boot_Print(" Read err.\r\n");
       return -3;
     }
 
-    hp_cnnx_build(pkt,
-                  CNNX_HDR_0, CNNX_HDR_1,
-                  CNNX_NODE_HP, CNNX_NODE_MASTER,
-                  (uint16_t)(s_packetId++), 0,
-                  CNNX_CMD_FWCODE,
-                  data_buf, chunk,
-                  HP_CNNX_CHECK_XOR_DST_TO_PAYLOAD_DUP,
-                  CNNX_TRL_0, CNNX_TRL_1);
-    uart6_send(pkt, CNNX_PKT_OVERHEAD + chunk);
+    /* Send block with retry (up to 3 attempts) */
+    int blk_ok = 0;
+    for (int retry = 0; retry < 3 && !blk_ok; retry++) {
+      if (retry > 0) {
+        Boot_Print("\r\n[HP] Blk %lu retry %d\r\n", (unsigned long)blk, retry);
+        HAL_Delay(10);
+        uart6_flush_rx();
+      }
 
-    ret = hp_cnnx_wait_cmd(CNNX_CMD_FWNEXT, 5000);
-    if (ret != 0) {
-      Boot_Print("\r\n[H562] Blk %lu err.\r\n", (unsigned long)blk);
+      hp_cnnx_build(pkt,
+                    CNNX_HDR_0, CNNX_HDR_1,
+                    CNNX_NODE_HP, CNNX_NODE_MASTER,
+                    (uint16_t)(s_packetId++), 0,
+                    CNNX_CMD_FWCODE,
+                    data_buf, chunk,
+                    HP_CNNX_CHECK_XOR_DST_TO_PAYLOAD_DUP,
+                    CNNX_TRL_0, CNNX_TRL_1);
+      uart6_send(pkt, CNNX_PKT_OVERHEAD + chunk);
+
+      ret = hp_cnnx_wait_cmd(CNNX_CMD_FWNEXT, 5000);
+      if (ret == 0)
+        blk_ok = 1;
+    }
+    if (!blk_ok) {
+      Boot_Print(" Blk %lu err.\r\n", (unsigned long)blk);
       return -4;
     }
 
     addr += chunk;
-    uint8_t pct = (uint8_t)(((blk + 1) * 100UL) / block_cnt);
-    if (pct / 10 > last_pct / 10) {
-      Boot_Print("\r[H562] %d%%", pct);
-      last_pct = pct;
+    uint8_t dots = (uint8_t)(((blk + 1) * 10UL) / block_cnt);
+    while (last_dot < dots) {
+      Boot_Print(".");
+      last_dot++;
     }
   }
 
-  Boot_Print("\r[H562] 100%%\r\n");
+  Boot_Print(" OK\r\n");
 
   hp_cnnx_build(pkt,
                 CNNX_HDR_0, CNNX_HDR_1,
@@ -560,10 +578,10 @@ int Boot_HP_UpdateFirmware(FIL *fp, const Elf_Info_t *elf)
 
   ret = hp_cnnx_wait_cmd(CNNX_CMD_FWSUCCESS, 5000);
   if (ret != 0) {
-    Boot_Print("[H562] Verify err.\r\n");
+    Boot_Print("[HP] Verify err.\r\n");
     return -5;
   }
 
-  Boot_Print("[H562] Update OK!\r\n");
+  Boot_Print("[HP] Update OK!\r\n");
   return 0;
 }

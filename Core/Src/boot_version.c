@@ -1,160 +1,132 @@
 /**
   ******************************************************************************
   * @file    boot_version.c
-  * @brief   Version management - records update history
+  * @brief   Version management - minimal slot-based storage
   *
-  *          Version info is stored in the last 256 bytes of Sector 3
-  *          (0x0800FF00 - 0x0800FFFF), within bootloader flash area.
-  *          This area is written once and not erased during app updates.
-  *
-  *          Layout at 0x0800FF00:
-  *            [0x00] Magic: 0x56455253 ("VERS")
-  *            [0x04] Pre-update version: 12 bytes (null-terminated string)
-  *            [0x10] Post-update version: 12 bytes
-  *            [0x1C] Update filename: 16 bytes
+  *          0x0800FF00-0x0800FFFF: 32 x 8-byte slots (magic + fdate).
+  *          Cannot erase sector 3 at runtime. Write to next empty slot.
+  *          Main app uses VER_MAGIC, HP app uses HP_MAGIC.
   ******************************************************************************
   */
 #include "boot_version.h"
-#include "boot_cmd.h"
 #include "stm32f4xx_hal.h"
-#include <string.h>
-#include <stdio.h>
 
-/* Version storage address in bootloader flash (end of sector 3) */
-#define VER_STORE_ADDR    0x0800FF00U
-#define VER_MAGIC         0x56455253U  /* "VERS" */
+#define VER_BASE    0x0800FF00U
+#define VER_MAGIC   0x56523032U  /* "VR02" - main app */
+#define HP_MAGIC    0x48503032U  /* "HP02" - HP app */
 
-/* Storage structure */
-typedef struct {
-  uint32_t magic;
-  char     pre_version[12];
-  char     post_version[12];
-  char     filename[16];
-} VerStore_t;
+typedef struct { uint32_t magic; uint16_t fdate; uint16_t pad; } VSlot_t;
+#define VER_SLOTS   (256 / sizeof(VSlot_t))  /* 32 */
 
-/* Month name lookup for __DATE__ parsing */
-static const char *s_months[] = {
-  "Jan","Feb","Mar","Apr","May","Jun",
-  "Jul","Aug","Sep","Oct","Nov","Dec"
-};
+static char s_buf[VERSION_STR_LEN];
 
-/* Static buffers */
-static char s_bootVer[VERSION_STR_LEN];
-static char s_appVer[VERSION_STR_LEN];
-
-/* ------------------------------------------------------------------ */
-/* Convert __DATE__ ("Mar 18 2026") to "2026-03-18"                   */
-/* ------------------------------------------------------------------ */
-static void date_to_version(const char *date_str, char *out)
+/* "YYYY-MM-DD" from FAT date, no snprintf */
+static void fmt_date(uint16_t fd, char *o)
 {
-  /* __DATE__ format: "Mmm DD YYYY" */
-  int month = 0;
-  for (int i = 0; i < 12; i++) {
-    if (date_str[0] == s_months[i][0] &&
-        date_str[1] == s_months[i][1] &&
-        date_str[2] == s_months[i][2]) {
-      month = i + 1;
-      break;
+  uint16_t y = ((fd >> 9) & 0x7F) + 1980;
+  uint8_t  m = (fd >> 5) & 0xF;
+  uint8_t  d = fd & 0x1F;
+  o[0] = '0' + y / 1000;
+  o[1] = '0' + (y / 100 % 10);
+  o[2] = '0' + (y / 10 % 10);
+  o[3] = '0' + (y % 10);
+  o[4] = '-';
+  o[5] = '0' + m / 10;
+  o[6] = '0' + m % 10;
+  o[7] = '-';
+  o[8] = '0' + d / 10;
+  o[9] = '0' + d % 10;
+  o[10] = '\0';
+}
+
+/* Parse __DATE__ month without string table */
+static uint8_t parse_month(const char *d)
+{
+  if (d[0] == 'J') return (d[1] == 'a') ? 1 : (d[2] == 'n') ? 6 : 7;
+  if (d[0] == 'F') return 2;
+  if (d[0] == 'M') return (d[2] == 'r') ? 3 : 5;
+  if (d[0] == 'A') return (d[1] == 'p') ? 4 : 8;
+  if (d[0] == 'S') return 9;
+  if (d[0] == 'O') return 10;
+  if (d[0] == 'N') return 11;
+  if (d[0] == 'D') return 12;
+  return 0;
+}
+
+/* ---- Shared helpers (one copy of loop, called with different magic) ---- */
+
+static const char* get_ver(uint32_t magic)
+{
+  int last = -1;
+  for (int i = 0; i < (int)VER_SLOTS; i++) {
+    const VSlot_t *s = (const VSlot_t *)(VER_BASE + i * sizeof(VSlot_t));
+    if (s->magic == magic) last = i;
+  }
+  if (last >= 0) {
+    const VSlot_t *s = (const VSlot_t *)(VER_BASE + last * sizeof(VSlot_t));
+    if (s->fdate != 0 && s->fdate != 0xFFFF) {
+      fmt_date(s->fdate, s_buf);
+      return s_buf;
     }
   }
+  return "--";
+}
 
-  int day = 0;
-  if (date_str[4] == ' ')
-    day = date_str[5] - '0';
-  else
-    day = (date_str[4] - '0') * 10 + (date_str[5] - '0');
+static void record_ver(uint32_t magic, uint16_t fdate)
+{
+  int target = -1;
+  for (int i = 0; i < (int)VER_SLOTS; i++) {
+    const uint32_t *p = (const uint32_t *)(VER_BASE + i * sizeof(VSlot_t));
+    if (p[0] == 0xFFFFFFFF && p[1] == 0xFFFFFFFF) { target = i; break; }
+  }
+  if (target < 0) return;
 
-  /* Year is at offset 7 */
-  if (month < 1 || month > 12) month = 0;
-  if (day < 1 || day > 31) day = 0;
-  snprintf(out, VERSION_STR_LEN, "%.4s-%02u-%02u",
-           &date_str[7], (unsigned)month, (unsigned)day);
+  VSlot_t slot;
+  slot.magic = magic;
+  slot.fdate = fdate;
+  slot.pad   = 0xFFFF;
+
+  uint32_t addr = VER_BASE + target * sizeof(VSlot_t);
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR |
+                         FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR |
+                         FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+  const uint32_t *src = (const uint32_t *)&slot;
+  HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr,     src[0]);
+  HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 4, src[1]);
+  HAL_FLASH_Lock();
 }
 
 /* ------------------------------------------------------------------ */
 const char* Boot_Version_GetBoot(void)
 {
-  if (s_bootVer[0] == '\0')
-    date_to_version(__DATE__, s_bootVer);
-  return s_bootVer;
+  static char bv[VERSION_STR_LEN];
+  if (bv[0] == '\0') {
+    const char *d = __DATE__;
+    uint8_t  mo = parse_month(d);
+    uint8_t  dy = (d[4] == ' ') ? (d[5] - '0')
+                                : ((d[4] - '0') * 10 + (d[5] - '0'));
+    uint16_t yr = (uint16_t)((d[7]-'0')*1000 + (d[8]-'0')*100
+                           + (d[9]-'0')*10   + (d[10]-'0'));
+    uint16_t fd = ((yr - 1980) << 9) | (mo << 5) | dy;
+    fmt_date(fd, bv);
+  }
+  return bv;
 }
 
 /* ------------------------------------------------------------------ */
-const char* Boot_Version_GetApp(void)
-{
-  const VerStore_t *store = (const VerStore_t *)VER_STORE_ADDR;
+const char* Boot_Version_GetApp(void) { return get_ver(VER_MAGIC); }
+const char* Boot_Version_GetHP(void)  { return get_ver(HP_MAGIC); }
 
-  if (store->magic == VER_MAGIC && store->post_version[0] != '\0' &&
-      store->post_version[0] != (char)0xFF) {
-    strncpy(s_appVer, store->post_version, VERSION_STR_LEN - 1);
-    s_appVer[VERSION_STR_LEN - 1] = '\0';
-    return s_appVer;
-  }
-  return "unknown";
+void Boot_Version_RecordPre(void) { /* no-op */ }
+
+void Boot_Version_RecordPost(const char *filename, uint16_t fdate)
+{
+  (void)filename;
+  record_ver(VER_MAGIC, fdate);
 }
 
-/* ------------------------------------------------------------------ */
-void Boot_Version_RecordPre(void)
+void Boot_Version_RecordHP(uint16_t fdate)
 {
-  /* Read current version before update */
-  const char *cur = Boot_Version_GetApp();
-  Boot_Print("[VER] Pre-update: %s\r\n", cur);
-}
-
-/* ------------------------------------------------------------------ */
-void Boot_Version_RecordPost(const char *filename)
-{
-  /* Try to extract version from filename (e.g., "RF_NE~1.ELF" or similar)
-     For 8.3 filenames, just record the filename itself.
-     The actual version is derived from the build date of the new firmware,
-     which we can read from the ELF. For simplicity, we use current date. */
-
-  VerStore_t newStore;
-  newStore.magic = VER_MAGIC;
-
-  /* Copy pre-update version */
-  const VerStore_t *oldStore = (const VerStore_t *)VER_STORE_ADDR;
-  if (oldStore->magic == VER_MAGIC) {
-    strncpy(newStore.pre_version, oldStore->post_version, 11);
-  } else {
-    strncpy(newStore.pre_version, "none", 11);
-  }
-  newStore.pre_version[11] = '\0';
-
-  /* Post-update version = current date (build date of bootloader as proxy) */
-  date_to_version(__DATE__, newStore.post_version);
-
-  /* Record filename */
-  strncpy(newStore.filename, filename ? filename : "unknown", 15);
-  newStore.filename[15] = '\0';
-
-  /* Write to flash (word by word) - this area is in bootloader sector 3 */
-  HAL_FLASH_Unlock();
-  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR |
-                         FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR |
-                         FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
-
-  /* Note: We can only write to erased (0xFF) flash.
-     If this area was already written, we skip to avoid errors.
-     In production, this area should be erased during bootloader update. */
-  const uint32_t *check = (const uint32_t *)VER_STORE_ADDR;
-  uint8_t area_erased = 1;
-  for (int i = 0; i < (int)(sizeof(VerStore_t) / 4); i++) {
-    if (check[i] != 0xFFFFFFFF) {
-      area_erased = 0;
-      break;
-    }
-  }
-
-  if (area_erased) {
-    const uint32_t *src = (const uint32_t *)&newStore;
-    for (uint32_t i = 0; i < sizeof(VerStore_t); i += 4) {
-      HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, VER_STORE_ADDR + i, src[i / 4]);
-    }
-  }
-
-  HAL_FLASH_Lock();
-
-  Boot_Print("[VER] Post-update: %s (file: %s)\r\n",
-             newStore.post_version, newStore.filename);
+  record_ver(HP_MAGIC, fdate);
 }
